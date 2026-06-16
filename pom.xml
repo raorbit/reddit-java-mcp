@@ -59,6 +59,12 @@
             <artifactId>caffeine</artifactId>
         </dependency>
 
+        <!-- Spring's CaffeineCacheManager lives here (not pulled in transitively) -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-context-support</artifactId>
+        </dependency>
+
         <!-- Bean validation for configuration properties -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
