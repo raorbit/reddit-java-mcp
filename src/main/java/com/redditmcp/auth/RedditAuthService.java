@@ -9,6 +9,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.concurrent.atomic.AtomicReference;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
@@ -42,6 +43,7 @@ public class RedditAuthService {
     private final AtomicReference<CachedToken> cachedToken = new AtomicReference<>();
     private final Object refreshLock = new Object();
 
+    @Autowired
     public RedditAuthService(RedditProperties properties, RestClient.Builder restClientBuilder) {
         this(properties, restClientBuilder, Clock.systemUTC());
     }
