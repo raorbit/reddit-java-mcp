@@ -1,17 +1,22 @@
 package com.redditmcp.client;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.redditmcp.auth.RedditAuthService;
 import com.redditmcp.config.RedditProperties;
 import com.redditmcp.model.CommentSummary;
 import com.redditmcp.model.PostSummary;
 import com.redditmcp.model.RedditUser;
 import com.redditmcp.model.SubredditInfo;
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatusCode;
+import org.springframework.http.client.ClientHttpResponse;
 import org.springframework.stereotype.Service;
 import org.springframework.util.StringUtils;
 import org.springframework.web.client.RestClient;
@@ -38,6 +43,24 @@ public class RedditApiClient {
     /** Floor for the retry-after delay reported on a 429 so callers never retry instantly. */
     private static final long MIN_RETRY_AFTER_SECONDS = 1;
 
+    /**
+     * Hard ceiling on a Reddit response body (8 MiB) so a malformed or hostile response cannot be
+     * read into an in-memory JSON tree unbounded. Reddit's listing responses are far smaller.
+     */
+    private static final int MAX_BODY_BYTES = 8 * 1024 * 1024;
+
+    /** Listing sorts {@code getSubredditPosts} places directly in the request path. */
+    private static final Set<String> SUBREDDIT_SORTS = Set.of("hot", "new", "top", "rising");
+
+    /** Sorts {@code searchPosts} accepts as the {@code sort} query parameter. */
+    private static final Set<String> SEARCH_SORTS = Set.of("relevance", "hot", "top", "new", "comments");
+
+    /** Sorts {@code getUserPosts} accepts as the {@code sort} query parameter. */
+    private static final Set<String> USER_SORTS = Set.of("new", "hot", "top");
+
+    /** Parses size-capped response bodies; configured with Jackson's safe stream-read defaults. */
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+
     private final RedditProperties properties;
     private final RedditAuthService authService;
     private final RestClient restClient;
@@ -54,7 +77,10 @@ public class RedditApiClient {
     @Cacheable(cacheNames = "redditGet", sync = true,
             key = "{'subredditPosts', #subreddit, #sort, #timeFilter, #limit}")
     public List<PostSummary> getSubredditPosts(String subreddit, String sort, String timeFilter, int limit) {
-        String resolvedSort = StringUtils.hasText(sort) ? sort : "hot";
+        // sort lands in the request path; allowlist it (default "hot") so an arbitrary value cannot
+        // select an unintended Reddit listing alias or yield a 404.
+        String resolvedSort =
+                StringUtils.hasText(sort) && SUBREDDIT_SORTS.contains(sort) ? sort : "hot";
         JsonNode listing = getJson(uri -> {
             uri.path("/r/{subreddit}/{sort}");
             uri.queryParam("limit", limit);
@@ -80,7 +106,7 @@ public class RedditApiClient {
                 uri.path("/search");
             }
             uri.queryParam("q", query);
-            if (StringUtils.hasText(sort)) {
+            if (StringUtils.hasText(sort) && SEARCH_SORTS.contains(sort)) {
                 uri.queryParam("sort", sort);
             }
             if (StringUtils.hasText(timeFilter)) {
@@ -175,7 +201,7 @@ public class RedditApiClient {
     public List<PostSummary> getUserPosts(String username, String sort, int limit) {
         JsonNode listing = getJson(uri -> {
             uri.path("/user/{username}/submitted");
-            if (StringUtils.hasText(sort)) {
+            if (StringUtils.hasText(sort) && USER_SORTS.contains(sort)) {
                 uri.queryParam("sort", sort);
             }
             uri.queryParam("limit", limit);
@@ -237,8 +263,30 @@ public class RedditApiClient {
                         throw new RedditApiException(
                                 "Reddit API request failed with HTTP " + status.value());
                     }
-                    return response.bodyTo(JsonNode.class);
+                    return parseBody(response);
                 });
+    }
+
+    /**
+     * Reads and parses a successful response body, refusing to materialise more than
+     * {@link #MAX_BODY_BYTES} into memory. A declared {@code Content-Length} over the cap is rejected
+     * up front; otherwise the body stream itself is read with a hard byte ceiling so a missing or
+     * dishonest length cannot defeat the bound. An empty body parses to {@code null}.
+     */
+    private static JsonNode parseBody(ClientHttpResponse response) throws IOException {
+        long declared = response.getHeaders().getContentLength();
+        if (declared > MAX_BODY_BYTES) {
+            throw new RedditApiException(
+                    "Reddit API response too large (" + declared + " bytes)");
+        }
+        try (InputStream body = response.getBody()) {
+            byte[] bytes = body.readNBytes(MAX_BODY_BYTES + 1);
+            if (bytes.length > MAX_BODY_BYTES) {
+                throw new RedditApiException(
+                        "Reddit API response exceeded the " + MAX_BODY_BYTES + "-byte limit");
+            }
+            return bytes.length == 0 ? null : MAPPER.readTree(bytes);
+        }
     }
 
     /**
