@@ -47,6 +47,12 @@
             <artifactId>spring-boot-starter</artifactId>
         </dependency>
 
+        <!-- RestClient and HTTP types for the Reddit API calls (client only, no servlet container) -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-web</artifactId>
+        </dependency>
+
         <!-- Response cache backend -->
         <dependency>
             <groupId>com.github.ben-manes.caffeine</groupId>
