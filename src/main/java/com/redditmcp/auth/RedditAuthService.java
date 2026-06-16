@@ -14,6 +14,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestClient;
+import org.springframework.web.client.RestClientResponseException;
 
 /**
  * Obtains and caches an app-only ("userless") OAuth bearer token for Reddit's free tier.
@@ -74,11 +75,22 @@ public class RedditAuthService {
     }
 
     /**
-     * Unconditionally fetches a fresh token, replacing any cached value. Used by the data API
-     * client to recover from a 401 even when the cached token has not yet expired.
+     * Refreshes the cached token in response to a 401, collapsing concurrent recoveries into a
+     * single fetch. The caller passes the token value it just used (the one that received the 401);
+     * under the refresh lock a new token is fetched only if the cached value still matches that seen
+     * token, meaning no other caller has refreshed in the meantime. Otherwise the already-refreshed
+     * cached value is returned without another network round trip.
+     *
+     * @param seenToken the bearer token the caller was using when it received the 401
+     * @return a fresh bearer token to retry with
      */
-    public String forceRefresh() {
+    public String forceRefresh(String seenToken) {
         synchronized (refreshLock) {
+            CachedToken current = cachedToken.get();
+            if (current != null && !current.value().equals(seenToken)) {
+                // Another caller already refreshed past the token we 401'd on; reuse it.
+                return current.value();
+            }
             return fetchAndCache().value();
         }
     }
@@ -95,14 +107,22 @@ public class RedditAuthService {
         String credentials = properties.getClientId() + ":" + properties.getClientSecret();
         String basic = Base64.getEncoder().encodeToString(credentials.getBytes(StandardCharsets.UTF_8));
 
-        TokenResponse response = restClient.post()
-                .uri(TOKEN_PATH)
-                .header(HttpHeaders.AUTHORIZATION, "Basic " + basic)
-                .header(HttpHeaders.USER_AGENT, properties.getUserAgent())
-                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
-                .body("grant_type=client_credentials")
-                .retrieve()
-                .body(TokenResponse.class);
+        TokenResponse response;
+        try {
+            response = restClient.post()
+                    .uri(TOKEN_PATH)
+                    .header(HttpHeaders.AUTHORIZATION, "Basic " + basic)
+                    .header(HttpHeaders.USER_AGENT, properties.getUserAgent())
+                    .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                    .body("grant_type=client_credentials")
+                    .retrieve()
+                    .body(TokenResponse.class);
+        } catch (RestClientResponseException ex) {
+            // Surface only the HTTP status; Spring's default message echoes the upstream response
+            // body (e.g. an OAuth error description), which we must not leak to the MCP client.
+            throw new IllegalStateException(
+                    "Failed to obtain Reddit access token (HTTP " + ex.getStatusCode().value() + ")");
+        }
 
         if (response == null || response.accessToken() == null) {
             throw new IllegalStateException("Reddit token response did not contain an access_token");

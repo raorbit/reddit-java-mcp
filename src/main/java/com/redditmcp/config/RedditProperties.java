@@ -1,20 +1,33 @@
 package com.redditmcp.config;
 
+import jakarta.validation.Valid;
+import jakarta.validation.constraints.NotBlank;
+import jakarta.validation.constraints.Positive;
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.validation.annotation.Validated;
 
 /**
  * Configuration bound from the {@code reddit.*} namespace.
  *
  * <p>Holds the Reddit API credentials and response-cache settings. Registered via
  * {@code @EnableConfigurationProperties} in a later phase, so this type carries no stereotype
- * annotation of its own.
+ * annotation of its own. The credential and user-agent fields are {@code @NotBlank} so that a
+ * misconfigured deployment fails fast at startup rather than on the first Reddit call.
  */
+@Validated
 @ConfigurationProperties(prefix = "reddit")
 public class RedditProperties {
 
+    @NotBlank
     private String clientId;
+
+    @NotBlank
     private String clientSecret;
+
+    @NotBlank
     private String userAgent;
+
+    @Valid
     private Cache cache = new Cache();
 
     public String getClientId() {
@@ -53,7 +66,11 @@ public class RedditProperties {
     public static class Cache {
 
         private boolean enabled = true;
+
+        @Positive
         private long ttlSeconds = 60;
+
+        @Positive
         private int maxSize = 500;
 
         public boolean isEnabled() {

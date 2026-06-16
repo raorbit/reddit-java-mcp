@@ -1,10 +1,13 @@
 package com.redditmcp.auth;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.content;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.header;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.method;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.requestTo;
+import static org.springframework.test.web.client.response.MockRestResponseCreators.withServerError;
+import static org.springframework.test.web.client.response.MockRestResponseCreators.withStatus;
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withSuccess;
 
 import com.redditmcp.config.RedditProperties;
@@ -14,9 +17,18 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.Base64;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import org.hamcrest.Matchers;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.client.ExpectedCount;
 import org.springframework.test.web.client.MockRestServiceServer;
@@ -25,6 +37,9 @@ import org.springframework.web.client.RestClient;
 class RedditAuthServiceTest {
 
     private static final String TOKEN_URL = "https://www.reddit.com/api/v1/access_token";
+
+    /** Fixed instant the clock is seeded with so expiry arithmetic is deterministic. */
+    private static final Instant FIXED_INSTANT = Instant.parse("2024-01-01T00:00:00Z");
 
     /** Clock whose instant can be advanced between steps to exercise expiry logic. */
     private static final class MutableClock extends Clock {
@@ -76,7 +91,7 @@ class RedditAuthServiceTest {
                 .andRespond(withSuccess(tokenJson("tok-1", 3600), MediaType.APPLICATION_JSON));
 
         RedditAuthService service =
-                new RedditAuthService(properties(), builder, new MutableClock(Instant.now()));
+                new RedditAuthService(properties(), builder, new MutableClock(FIXED_INSTANT));
 
         assertThat(service.getAccessToken()).isEqualTo("tok-1");
         assertThat(service.getAccessToken()).isEqualTo("tok-1");
@@ -94,7 +109,7 @@ class RedditAuthServiceTest {
                 .andExpect(method(HttpMethod.POST))
                 .andRespond(withSuccess(tokenJson("tok-2", 3600), MediaType.APPLICATION_JSON));
 
-        MutableClock clock = new MutableClock(Instant.now());
+        MutableClock clock = new MutableClock(FIXED_INSTANT);
         RedditAuthService service = new RedditAuthService(properties(), builder, clock);
 
         assertThat(service.getAccessToken()).isEqualTo("tok-1");
@@ -117,11 +132,118 @@ class RedditAuthServiceTest {
                 .andRespond(withSuccess(tokenJson("tok-2", 3600), MediaType.APPLICATION_JSON));
 
         RedditAuthService service =
-                new RedditAuthService(properties(), builder, new MutableClock(Instant.now()));
+                new RedditAuthService(properties(), builder, new MutableClock(FIXED_INSTANT));
 
         assertThat(service.getAccessToken()).isEqualTo("tok-1");
-        // tok-1 is still valid, but forceRefresh must hit the endpoint regardless.
-        assertThat(service.forceRefresh()).isEqualTo("tok-2");
+        // tok-1 is still valid, but forceRefresh on the token we just used must fetch a new one.
+        assertThat(service.forceRefresh("tok-1")).isEqualTo("tok-2");
+        server.verify();
+    }
+
+    @Test
+    void forceRefreshCollapsesWhenCacheAlreadyMoved() {
+        RestClient.Builder builder = RestClient.builder();
+        MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+        server.expect(ExpectedCount.once(), requestTo(TOKEN_URL))
+                .andExpect(method(HttpMethod.POST))
+                .andRespond(withSuccess(tokenJson("tok-1", 3600), MediaType.APPLICATION_JSON));
+
+        RedditAuthService service =
+                new RedditAuthService(properties(), builder, new MutableClock(FIXED_INSTANT));
+
+        // Cache now holds tok-1; a caller that already saw an older token must not trigger a fetch.
+        assertThat(service.getAccessToken()).isEqualTo("tok-1");
+        assertThat(service.forceRefresh("stale-token")).isEqualTo("tok-1");
+        server.verify();
+    }
+
+    @Test
+    void tokenResponseWithoutAccessTokenThrows() {
+        RestClient.Builder builder = RestClient.builder();
+        MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+        server.expect(ExpectedCount.once(), requestTo(TOKEN_URL))
+                .andExpect(method(HttpMethod.POST))
+                .andRespond(withSuccess("{}", MediaType.APPLICATION_JSON));
+
+        RedditAuthService service =
+                new RedditAuthService(properties(), builder, new MutableClock(FIXED_INSTANT));
+
+        assertThatThrownBy(service::getAccessToken)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessage("Reddit token response did not contain an access_token");
+        server.verify();
+    }
+
+    @Test
+    void failedFetchIsNotCachedAndRetriesOnNextCall() {
+        RestClient.Builder builder = RestClient.builder();
+        MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+        server.expect(ExpectedCount.once(), requestTo(TOKEN_URL))
+                .andExpect(method(HttpMethod.POST))
+                .andRespond(withStatus(HttpStatus.UNAUTHORIZED));
+        server.expect(ExpectedCount.once(), requestTo(TOKEN_URL))
+                .andExpect(method(HttpMethod.POST))
+                .andRespond(withServerError());
+        server.expect(ExpectedCount.once(), requestTo(TOKEN_URL))
+                .andExpect(method(HttpMethod.POST))
+                .andRespond(withSuccess(tokenJson("tok-1", 3600), MediaType.APPLICATION_JSON));
+
+        RedditAuthService service =
+                new RedditAuthService(properties(), builder, new MutableClock(FIXED_INSTANT));
+
+        // 401 surfaces as a sanitized IllegalStateException (status only, no body) and nothing is cached.
+        assertThatThrownBy(service::getAccessToken)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("401");
+        // 500 propagates too; the previous failure left the cache empty so we hit the endpoint again.
+        assertThatThrownBy(service::getAccessToken)
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("500");
+        // Once the endpoint succeeds the token is finally cached and returned.
+        assertThat(service.getAccessToken()).isEqualTo("tok-1");
+        server.verify();
+    }
+
+    @Test
+    void concurrentCallersShareSingleFetch() throws InterruptedException {
+        RestClient.Builder builder = RestClient.builder();
+        MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+        // Exactly one fetch is permitted: the double-checked lock must collapse the stampede.
+        server.expect(ExpectedCount.once(), requestTo(TOKEN_URL))
+                .andExpect(method(HttpMethod.POST))
+                .andRespond(withSuccess(tokenJson("tok-1", 3600), MediaType.APPLICATION_JSON));
+
+        RedditAuthService service =
+                new RedditAuthService(properties(), builder, new MutableClock(FIXED_INSTANT));
+
+        int threads = 8;
+        ExecutorService pool = Executors.newFixedThreadPool(threads);
+        CountDownLatch ready = new CountDownLatch(threads);
+        CountDownLatch start = new CountDownLatch(1);
+        Set<String> tokens = ConcurrentHashMap.newKeySet();
+        List<Throwable> failures = new CopyOnWriteArrayList<>();
+
+        for (int i = 0; i < threads; i++) {
+            pool.execute(() -> {
+                ready.countDown();
+                try {
+                    start.await();
+                    tokens.add(service.getAccessToken());
+                } catch (Throwable t) {
+                    failures.add(t);
+                }
+            });
+        }
+
+        // Release all threads at once so they race for the refresh lock simultaneously.
+        ready.await(5, TimeUnit.SECONDS);
+        start.countDown();
+        pool.shutdown();
+        assertThat(pool.awaitTermination(10, TimeUnit.SECONDS)).isTrue();
+
+        assertThat(failures).isEmpty();
+        assertThat(tokens).containsExactly("tok-1");
+        // ExpectedCount.once() above asserts a single HTTP fetch occurred despite the stampede.
         server.verify();
     }
 
@@ -142,7 +264,7 @@ class RedditAuthServiceTest {
                 .andRespond(withSuccess(tokenJson("tok-1", 3600), MediaType.APPLICATION_JSON));
 
         RedditAuthService service =
-                new RedditAuthService(properties(), builder, new MutableClock(Instant.now()));
+                new RedditAuthService(properties(), builder, new MutableClock(FIXED_INSTANT));
 
         assertThat(service.getAccessToken()).isEqualTo("tok-1");
         server.verify();

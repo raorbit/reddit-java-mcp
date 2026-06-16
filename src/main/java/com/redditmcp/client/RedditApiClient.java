@@ -35,6 +35,9 @@ public class RedditApiClient {
     private static final int MAX_TEXT_LENGTH = 500;
     private static final int MAX_REPLIES_PER_NODE = 5;
 
+    /** Floor for the retry-after delay reported on a 429 so callers never retry instantly. */
+    private static final long MIN_RETRY_AFTER_SECONDS = 1;
+
     private final RedditProperties properties;
     private final RedditAuthService authService;
     private final RestClient restClient;
@@ -48,8 +51,8 @@ public class RedditApiClient {
         this.restClient = restClientBuilder.baseUrl(DATA_BASE_URL).build();
     }
 
-    @Cacheable(cacheNames = "redditGet",
-            key = "'subredditPosts:' + #subreddit + ':' + #sort + ':' + #timeFilter + ':' + #limit")
+    @Cacheable(cacheNames = "redditGet", sync = true,
+            key = "{'subredditPosts', #subreddit, #sort, #timeFilter, #limit}")
     public List<PostSummary> getSubredditPosts(String subreddit, String sort, String timeFilter, int limit) {
         String resolvedSort = StringUtils.hasText(sort) ? sort : "hot";
         JsonNode listing = getJson(uri -> {
@@ -64,8 +67,8 @@ public class RedditApiClient {
         return mapPosts(listing);
     }
 
-    @Cacheable(cacheNames = "redditGet",
-            key = "'searchPosts:' + #query + ':' + #subreddit + ':' + #sort + ':' + #timeFilter + ':' + #limit")
+    @Cacheable(cacheNames = "redditGet", sync = true,
+            key = "{'searchPosts', #query, #subreddit, #sort, #timeFilter, #limit}")
     public List<PostSummary> searchPosts(
             String query, String subreddit, String sort, String timeFilter, int limit) {
         boolean restrict = StringUtils.hasText(subreddit);
@@ -90,8 +93,8 @@ public class RedditApiClient {
         return mapPosts(listing);
     }
 
-    @Cacheable(cacheNames = "redditGet",
-            key = "'postComments:' + #postId + ':' + #limit + ':' + #depth")
+    @Cacheable(cacheNames = "redditGet", sync = true,
+            key = "{'postComments', #postId, #limit, #depth}")
     public List<CommentSummary> getPostComments(String postId, int limit, int depth) {
         JsonNode response = getJson(uri -> {
             uri.path("/comments/{postId}");
@@ -108,23 +111,34 @@ public class RedditApiClient {
         JsonNode commentsListing = response.get(1);
         List<CommentSummary> result = new ArrayList<>();
         for (JsonNode data : listingChildren(commentsListing, "t1")) {
+            // Reddit treats `limit` as an approximate cap on the whole tree, so enforce the
+            // documented top-level bound client-side.
+            if (result.size() >= limit) {
+                break;
+            }
             result.add(mapComment(data, 0, depth));
         }
         return result;
     }
 
-    @Cacheable(cacheNames = "redditGet", key = "'subredditInfo:' + #subreddit")
+    @Cacheable(cacheNames = "redditGet", unless = "#result == null",
+            key = "{'subredditInfo', #subreddit}")
     public SubredditInfo getSubredditInfo(String subreddit) {
-        JsonNode thing = getJson(uri -> {
-            uri.path("/r/{subreddit}/about");
-            uri.queryParam("raw_json", 1);
-            return uri.build(subreddit);
-        });
+        JsonNode thing;
+        try {
+            thing = getJson(uri -> {
+                uri.path("/r/{subreddit}/about");
+                uri.queryParam("raw_json", 1);
+                return uri.build(subreddit);
+            });
+        } catch (NotFoundException ex) {
+            return null;
+        }
         JsonNode data = thing == null ? null : thing.path("data");
         return mapSubreddit(data);
     }
 
-    @Cacheable(cacheNames = "redditGet", key = "'searchSubreddits:' + #query + ':' + #limit")
+    @Cacheable(cacheNames = "redditGet", sync = true, key = "{'searchSubreddits', #query, #limit}")
     public List<SubredditInfo> searchSubreddits(String query, int limit) {
         JsonNode listing = getJson(uri -> {
             uri.path("/subreddits/search");
@@ -140,18 +154,24 @@ public class RedditApiClient {
         return result;
     }
 
-    @Cacheable(cacheNames = "redditGet", key = "'userInfo:' + #username")
+    @Cacheable(cacheNames = "redditGet", unless = "#result == null",
+            key = "{'userInfo', #username}")
     public RedditUser getUserInfo(String username) {
-        JsonNode thing = getJson(uri -> {
-            uri.path("/user/{username}/about");
-            uri.queryParam("raw_json", 1);
-            return uri.build(username);
-        });
+        JsonNode thing;
+        try {
+            thing = getJson(uri -> {
+                uri.path("/user/{username}/about");
+                uri.queryParam("raw_json", 1);
+                return uri.build(username);
+            });
+        } catch (NotFoundException ex) {
+            return null;
+        }
         JsonNode data = thing == null ? null : thing.path("data");
         return mapUser(data);
     }
 
-    @Cacheable(cacheNames = "redditGet", key = "'userPosts:' + #username + ':' + #sort + ':' + #limit")
+    @Cacheable(cacheNames = "redditGet", sync = true, key = "{'userPosts', #username, #sort, #limit}")
     public List<PostSummary> getUserPosts(String username, String sort, int limit) {
         JsonNode listing = getJson(uri -> {
             uri.path("/user/{username}/submitted");
@@ -169,13 +189,30 @@ public class RedditApiClient {
 
     /**
      * Performs an authenticated GET and returns the parsed JSON body. On a 401 the token is forcibly
-     * refreshed and the request retried exactly once; a 429 raises {@link RedditRateLimitException}.
+     * refreshed and the request retried exactly once (a second 401 becomes a {@link
+     * RedditApiException}); a 429 raises {@link RedditRateLimitException} and a 404 a {@link
+     * NotFoundException}.
      */
     private JsonNode getJson(java.util.function.Function<UriBuilder, java.net.URI> uriFunction) {
+        String token = authService.getAccessToken();
         try {
-            return doGet(uriFunction, authService.getAccessToken());
+            return doGet(uriFunction, token);
         } catch (UnauthorizedException ex) {
-            return doGet(uriFunction, authService.forceRefresh());
+            String refreshed;
+            try {
+                refreshed = authService.forceRefresh(token);
+            } catch (RedditApiException alreadyWrapped) {
+                throw alreadyWrapped;
+            } catch (RuntimeException refreshFailure) {
+                throw new RedditApiException(
+                        "Failed to refresh Reddit access token after HTTP 401", refreshFailure);
+            }
+            try {
+                return doGet(uriFunction, refreshed);
+            } catch (UnauthorizedException retryEx) {
+                throw new RedditApiException(
+                        "Reddit API request failed with HTTP 401 after token refresh");
+            }
         }
     }
 
@@ -190,6 +227,9 @@ public class RedditApiClient {
                     if (status.value() == 401) {
                         throw new UnauthorizedException();
                     }
+                    if (status.value() == 404) {
+                        throw new NotFoundException();
+                    }
                     if (status.value() == 429) {
                         throw new RedditRateLimitException(parseRetryAfter(response.getHeaders()));
                     }
@@ -201,22 +241,48 @@ public class RedditApiClient {
                 });
     }
 
+    /**
+     * Derives a retry-after delay (seconds) for a 429. Prefers Reddit's {@code x-ratelimit-reset}
+     * (seconds until the rate-limit window resets), falls back to the standard {@code Retry-After}
+     * header when that is absent or malformed, and never returns less than
+     * {@link #MIN_RETRY_AFTER_SECONDS} so callers do not retry instantly.
+     */
     private static long parseRetryAfter(HttpHeaders headers) {
         String reset = headers.getFirst("x-ratelimit-reset");
         if (reset != null) {
             try {
-                return (long) Math.ceil(Double.parseDouble(reset.trim()));
+                return Math.max(MIN_RETRY_AFTER_SECONDS,
+                        (long) Math.ceil(Double.parseDouble(reset.trim())));
             } catch (NumberFormatException ignored) {
-                // fall through to default
+                // fall through to Retry-After / default
             }
         }
-        return 0L;
+        String retryAfter = headers.getFirst(HttpHeaders.RETRY_AFTER);
+        if (retryAfter != null) {
+            try {
+                return Math.max(MIN_RETRY_AFTER_SECONDS, Long.parseLong(retryAfter.trim()));
+            } catch (NumberFormatException ignored) {
+                // Retry-After may be an HTTP-date, which we do not parse; fall through to default.
+            }
+        }
+        return MIN_RETRY_AFTER_SECONDS;
     }
 
     /** Sentinel used to unwind out of the {@code exchange} lambda so a 401 can be retried. */
     private static final class UnauthorizedException extends RuntimeException {
         UnauthorizedException() {
             super(null, null, false, false);
+        }
+    }
+
+    /**
+     * Thrown by {@link #doGet} on an HTTP 404. The {@code /about} lookups catch this to return
+     * {@code null} for a nonexistent subreddit/user; for every other endpoint it propagates as the
+     * {@link RedditApiException} it extends, so a 404 there still surfaces as an API error.
+     */
+    private static final class NotFoundException extends RedditApiException {
+        NotFoundException() {
+            super("Reddit API request failed with HTTP 404");
         }
     }
 
