@@ -112,6 +112,21 @@ The response cache is configurable:
 
 On an HTTP `429` response, the server surfaces a clear "rate limit; retry in N seconds" error. On an HTTP `401`, it refreshes the token and retries the request once.
 
+## Security
+
+- **Untrusted content / prompt injection:** every tool response is wrapped in an envelope with a
+  fixed `notice` that flags the payload as untrusted, user-generated Reddit content (post and comment
+  text, usernames, subreddit descriptions). That text can contain instructions crafted to manipulate
+  an LLM, so the consuming model should treat all returned fields as data, never as commands. The
+  server labels the content rather than altering it, preserving fidelity.
+- **Input validation & least privilege:** subreddit/user identifiers and post ids are validated
+  against Reddit's naming rules, `sort` values are checked against per-endpoint allowlists before
+  they reach the request, and `limit`/`depth` are clamped to small ranges.
+- **Resilience:** both HTTP clients use finite connect/read timeouts, response bodies are read with a
+  hard size cap, and token-endpoint errors are surfaced without echoing upstream response bodies.
+- **Credentials:** supplied only via environment variables and never logged; logs go to a file so the
+  MCP stdio channel stays clean.
+
 ## Notes
 
 - **Tech stack:** Spring Boot 3.5.x, Spring AI MCP server starter (stdio transport), Caffeine cache, Java 21.

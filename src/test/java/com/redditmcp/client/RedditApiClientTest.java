@@ -21,6 +21,7 @@ import com.redditmcp.model.CommentSummary;
 import com.redditmcp.model.PostSummary;
 import com.redditmcp.model.RedditUser;
 import com.redditmcp.model.SubredditInfo;
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 import org.hamcrest.Matchers;
 import org.junit.jupiter.api.AfterEach;
@@ -35,6 +36,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.mock.http.client.MockClientHttpResponse;
 import org.springframework.test.web.client.ExpectedCount;
 import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestClient;
@@ -516,6 +518,56 @@ class RedditApiClientTest {
         List<CommentSummary> comments = client.getPostComments("abc", 2, 3);
 
         assertThat(comments).hasSize(2);
+        server.verify();
+    }
+
+    @Test
+    void unknownSubredditSortFallsBackToHotPath() {
+        // "controversial" is not in the allowlist; it must not reach the path as a listing alias.
+        server.expect(ExpectedCount.once(),
+                        requestTo(Matchers.startsWith("https://oauth.reddit.com/r/java/hot")))
+                .andExpect(method(HttpMethod.GET))
+                .andRespond(withSuccess(SUBREDDIT_LISTING, MediaType.APPLICATION_JSON));
+
+        List<PostSummary> posts = client.getSubredditPosts("java", "controversial", null, 5);
+
+        assertThat(posts).hasSize(2);
+        server.verify();
+    }
+
+    @Test
+    void unknownUserSortIsDroppedFromQuery() {
+        server.expect(ExpectedCount.once(),
+                        requestTo(Matchers.allOf(
+                                Matchers.startsWith("https://oauth.reddit.com/user/alice/submitted"),
+                                Matchers.not(Matchers.containsString("sort")))))
+                .andExpect(method(HttpMethod.GET))
+                .andRespond(withSuccess(SUBREDDIT_LISTING, MediaType.APPLICATION_JSON));
+
+        // "controversial" is not an accepted user-posts sort, so the sort param is omitted entirely.
+        List<PostSummary> posts = client.getUserPosts("alice", "controversial", 5);
+
+        assertThat(posts).hasSize(2);
+        server.verify();
+    }
+
+    @Test
+    void oversizedResponseByContentLengthThrowsApiError() {
+        server.expect(ExpectedCount.once(),
+                        requestTo(Matchers.startsWith("https://oauth.reddit.com/r/java/hot")))
+                .andExpect(method(HttpMethod.GET))
+                .andRespond(request -> {
+                    MockClientHttpResponse response = new MockClientHttpResponse(
+                            "{}".getBytes(StandardCharsets.UTF_8), HttpStatus.OK);
+                    response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
+                    // Declare a body far larger than the 8 MiB cap; parsing must be refused up front.
+                    response.getHeaders().setContentLength(9_000_000L);
+                    return response;
+                });
+
+        assertThatThrownBy(() -> client.getSubredditPosts("java", "hot", null, 5))
+                .isInstanceOf(RedditApiException.class)
+                .hasMessageContaining("too large");
         server.verify();
     }
 
